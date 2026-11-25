@@ -7,9 +7,12 @@ struct ClientView: View {
     @State private var host = ""
     @State private var port = "47800"
     @State private var code = ""
+    @State private var normalKeyboard = false
     @State private var text = ""
     @State private var confirm: (Power, String)?
     @State private var credentials: (user: String, password: String) = ("", "")
+
+    private var securePrompt: Binding<Bool> { Binding(get: { model.secureComparison != nil }, set: { if !$0 { model.secureComparison = nil } }) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -36,6 +39,18 @@ struct ClientView: View {
                 Text(model.message)
                     .accessibilityAddTraits(.updatesFrequently)
             }
+        }
+        .confirmationDialog("Use Normal Keyboard Only?", isPresented: $normalKeyboard, titleVisibility: .visible) {
+            Button("Use Normal Keyboard Only") { model.useNormalKeyboard() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Secure-screen input will be unavailable. Ordinary input can be read by the Windows application.")
+        }
+        .alert("Allow Secure Screens", isPresented: securePrompt) {
+            Button("Numbers Match") { model.confirmSecureInput() }
+            Button("Cancel", role: .cancel) { model.secureComparison = nil }
+        } message: {
+            Text("Compare this number with the administrator window on the Windows computer: " + (model.secureComparison ?? "").map(String.init).joined(separator: " ") + ". Only confirm if both numbers match.")
         }
         .padding(20)
         .onAppear { model.startDiscovery() }
@@ -124,6 +139,10 @@ struct ClientView: View {
     private func controls(_ info: ServerInfo) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(info.sessionDescription)
+            if info.os == "windows" {
+                Button("Allow Secure Screens") { model.beginSecureEnrollment() }
+                Button("Use Normal Keyboard Only") { model.setCapturing(false); normalKeyboard = true }
+            }
             Toggle("Send Keyboard to Computer", isOn: Binding(get: { model.capturing }, set: { model.setCapturing($0) }))
             Text(model.capturing
                  ? "Every key goes to \(info.name). Control-Command-Escape returns the keyboard to this Mac."

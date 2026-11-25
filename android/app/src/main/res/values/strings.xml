@@ -192,4 +192,9 @@
         <item quantity="one">%d file</item>
         <item quantity="other">%d files</item>
     </plurals>
+    <string name="secure_enroll">Allow Secure Screens</string>
+    <string name="secure_compare">Compare this number with the administrator window on the Windows computer: %1$s. Only confirm if both numbers match.</string>
+    <string name="secure_match">Numbers Match</string>
+    <string name="normal_keyboard">Use Normal Keyboard Only</string>
+    <string name="normal_keyboard_warning">Secure-screen input will be unavailable. Ordinary input can be read by the Windows application.</string>
 </resources>

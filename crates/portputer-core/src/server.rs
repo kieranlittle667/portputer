@@ -55,6 +55,7 @@ pub struct ConnectedClient {
 }
 
 struct Shared {
+    secure_input: Mutex<Option<Arc<dyn crate::secure_input::Relay>>>,
     store: ServerStore,
     identity: Identity,
     session: SessionKind,
@@ -148,6 +149,7 @@ impl Server {
         let session = config.session;
         std::thread::Builder::new().name("portputer-input".into()).spawn(move || input_thread(session, input_rx))?;
         let shared = Arc::new(Shared {
+            secure_input: Mutex::new(None),
             store,
             identity,
             session,
@@ -208,6 +210,10 @@ impl Server {
         let server = Server { shared, runtime: Some(runtime), port, _announcement: announcement };
         server.restart_relay();
         Ok(server)
+    }
+
+    pub fn set_secure_input_relay(&self, relay: Arc<dyn crate::secure_input::Relay>) {
+        *self.shared.secure_input.lock().unwrap() = Some(relay);
     }
 
     pub fn port(&self) -> u16 {
@@ -398,6 +404,7 @@ async fn serve(shared: Arc<Shared>, stream: transport::BoxStream, address: Optio
         shared.emit(ServerEvent::Connected { client_id: client_id.clone(), name: name.clone(), address: shown_address.clone() });
     }
 
+    let secure_input = shared.secure_input.lock().unwrap().is_some();
     writer
         .send(&ServerMessage::Welcome {
             server_id: shared.identity.id(),
@@ -412,6 +419,7 @@ async fn serve(shared: Arc<Shared>, stream: transport::BoxStream, address: Optio
             mute: audio_available(shared.session) && platform::can_mute_speakers(),
             mic: microphone_available(),
             files: files_available(shared.session),
+            secure_input,
         })
         .await?;
     if let Some(purpose) = datagram {
@@ -443,6 +451,7 @@ async fn serve(shared: Arc<Shared>, stream: transport::BoxStream, address: Optio
     let mut audio: Option<AudioSubscription> = None;
     let mut mic: Option<MicSink> = None;
     let mut clipboard_watch: Option<tokio::task::JoinHandle<()>> = None;
+    let mut secure_pipe: Option<Box<dyn crate::secure_input::RelayConnection>> = None;
     let result: Result<(), Error> = async {
         loop {
             let message: ClientMessage = tokio::time::timeout(Duration::from_secs(30), reader.recv())
@@ -499,6 +508,34 @@ async fn serve(shared: Arc<Shared>, stream: transport::BoxStream, address: Optio
                     writer
                         .send(&ServerMessage::Error { code: errors::NOT_PAIRED.into(), message: "This device isn't paired.".into() })
                         .await?;
+                }
+                ClientMessage::SecureInput { request } => {
+                    let relay = shared.secure_input.lock().unwrap().clone();
+                    let pipe = secure_pipe.take();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let mut pipe = match pipe {
+                            Some(pipe) => pipe,
+                            None => relay.ok_or("Secure-screen input is unavailable.")?.connect()?,
+                        };
+                        let reply = pipe.exchange(request)?;
+                        Ok::<_,String>((pipe, reply))
+                    }).await.map_err(|_| Error::Protocol("secure-input relay stopped".into()))?;
+                    match result {
+                        Ok((pipe,mut reply)) => {
+                            secure_pipe=Some(pipe);
+                            if let Some(input)=reply.normal_input.take() {
+                                let command=match input {
+                                    crate::secure_input::Input::Key {code,down,repeat}=>InputCommand::Key(code,down,repeat),
+                                    crate::secure_input::Input::Tap {code,modifiers}=>InputCommand::Tap(code,modifiers),
+                                    crate::secure_input::Input::Text {text}=>InputCommand::Text(text),
+                                    crate::secure_input::Input::Release=>InputCommand::ReleaseAll,
+                                };
+                                let _=shared.input.send(command);
+                            }
+                            writer.send(&ServerMessage::SecureInput {reply}).await?;
+                        }
+                        Err(_) => writer.send(&ServerMessage::Notice {code:"secure_input_unavailable".into(), message:"Secure-screen input is unavailable. Check the helper installation and version.".into()}).await?,
+                    }
                 }
                 ClientMessage::Hello { .. } => {}
                 ClientMessage::Key { code, down, repeat } => {

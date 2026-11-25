@@ -74,6 +74,14 @@ class ConnectedActivity : Activity(), Connection.Listener {
         power = findViewById(R.id.power)
         disconnect = findViewById(R.id.disconnect)
 
+        findViewById<Button>(R.id.secure_enroll).setOnClickListener { Connection.beginSecureEnrollment() }
+        findViewById<Button>(R.id.normal_keyboard).setOnClickListener {
+            Connection.setCapturing(false)
+            AlertDialog.Builder(this).setTitle(R.string.normal_keyboard)
+                .setMessage(R.string.normal_keyboard_warning)
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(R.string.normal_keyboard) { _, _ -> Connection.useNormalKeyboard() }.show()
+        }
         pairButton.setOnClickListener { pair() }
         pairCode.setOnEditorActionListener { _, action, _ ->
             if (action == EditorInfo.IME_ACTION_DONE) {
@@ -154,6 +162,16 @@ class ConnectedActivity : Activity(), Connection.Listener {
     }
 
     private fun render() {
+        findViewById<Button>(R.id.secure_enroll).visibility = if (Connection.info?.os == "windows" && Connection.info?.trusted == true) View.VISIBLE else View.GONE
+        findViewById<Button>(R.id.normal_keyboard).visibility = findViewById<Button>(R.id.secure_enroll).visibility
+        Connection.takeSecureComparison()?.let { comparison ->
+            AlertDialog.Builder(this)
+                .setTitle(R.string.secure_enroll)
+                .setMessage(getString(R.string.secure_compare, comparison.toCharArray().joinToString(" ")))
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(R.string.secure_match) { _, _ -> Connection.confirmSecureInput(comparison) }
+                .show()
+        }
         updating = true
         when (val state = Connection.state) {
             is Connection.State.Idle -> {

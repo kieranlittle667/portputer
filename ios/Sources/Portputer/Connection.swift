@@ -61,6 +61,13 @@ final class Connection: ObservableObject {
     @Published private(set) var relayAvailable = false
     /// Modifiers held from Keys and Shortcuts.
     @Published private(set) var held: Set<String> = []
+    @Published var secureComparison: String?
+    func useNormalKeyboard() { secureComparison = nil; session?.useNormalKeyboard() }
+    func beginSecureEnrollment() { session?.beginSecureEnrollment() }
+    func confirmSecureInput() {
+        if let comparison = secureComparison { session?.confirmSecureInput(comparison: comparison) }
+        secureComparison = nil
+    }
     @Published var message = ""
     @Published var sendKeyboard = Settings.sendKeyboard {
         didSet {
@@ -429,7 +436,10 @@ final class Connection: ObservableObject {
             }
         }
 
-        func notice(code: String, message: String) { onMain { $0.message = message } }
+        func notice(code: String, message: String) { onMain { m in
+            if code == "secure_input_compare" { m.sendKeyboard = false; m.secureComparison = message }
+            else { m.message = message }
+        } }
 
         func error(code: String, message: String) {
             onMain { c in

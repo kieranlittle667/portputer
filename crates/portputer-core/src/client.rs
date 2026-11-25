@@ -110,6 +110,9 @@ pub struct ClientConfig {
 enum Command {
     Send(ClientMessage),
     UseRelay(bool),
+    SecureEnroll,
+    NormalKeyboard,
+    SecureConfirm(String),
     Pair(String, std::sync::mpsc::Sender<Result<(), String>>),
     Close,
 }
@@ -137,6 +140,7 @@ pub struct Session {
 }
 
 struct Conn {
+    secure_input: bool,
     reader: Reader,
     writer: Writer,
     hash: Vec<u8>,
@@ -222,7 +226,7 @@ async fn connect_once(
     let welcome: ServerMessage = tokio::time::timeout(Duration::from_secs(10), reader.recv())
         .await
         .map_err(|_| Error::Protocol("no welcome from the server".into()))??;
-    let ServerMessage::Welcome { server_id, name: server_name, os, session, user, paired, version, power, audio, mute, mic, files } = welcome else {
+    let ServerMessage::Welcome { server_id, name: server_name, os, session, user, paired, version, power, audio, mute, mic, files, secure_input } = welcome else {
         if let ServerMessage::Error { message, .. } = welcome {
             return Err(Error::Refused(message));
         }
@@ -233,6 +237,7 @@ async fn connect_once(
     }
     let pinned = store.server(&id).is_some_and(|s| s.public_key == hs.remote_static);
     Ok(Conn {
+        secure_input,
         reader,
         writer: hs.writer,
         hash: hs.hash,
@@ -318,6 +323,12 @@ impl Session {
     fn send(&self, message: ClientMessage) {
         let _ = self.inner.tx.send(Command::Send(message));
     }
+
+    pub fn use_normal_keyboard(&self) {let _=self.inner.tx.send(Command::NormalKeyboard);}
+
+    pub fn begin_secure_enrollment(&self) { let _=self.inner.tx.send(Command::SecureEnroll); }
+
+    pub fn confirm_secure_input(&self, comparison:&str) { let _=self.inner.tx.send(Command::SecureConfirm(comparison.into())); }
 
     pub fn key(&self, code: &str, down: bool, repeat: bool) {
         self.send(ClientMessage::Key { code: code.to_string(), down, repeat });
@@ -622,6 +633,7 @@ impl Supervisor {
                         }
                         Command::Send(_) => {}
                         Command::UseRelay(on) => self.use_relay = on,
+                        Command::SecureEnroll | Command::SecureConfirm(_) | Command::NormalKeyboard => {},
                     }
                 }
                 let attempt = match &endpoint {
@@ -656,7 +668,7 @@ impl Supervisor {
     }
 
     async fn serve(&mut self, conn: Conn, rx: &mut mpsc::UnboundedReceiver<Command>) -> Ended {
-        let Conn { mut reader, writer, hash, public_key, mut info, peer_ip } = conn;
+        let Conn { mut reader, writer, hash, public_key, mut info, peer_ip, secure_input } = conn;
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Result<ServerMessage, Error>>();
         let read_task = tokio::spawn(async move {
             loop {
@@ -667,6 +679,14 @@ impl Supervisor {
                 }
             }
         });
+        let mut secure = crate::secure_input::Device::new(self.identity.private, &self.inner.store_dir, &info.id);
+        let mut secure_poll = tokio::time::interval(Duration::from_millis(250));
+        secure_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut secure_available = info.trusted && secure_input;
+        let mut secure_restart=false;
+        let mut secure_retry_at=Instant::now();
+        let mut secure_unavailable_reported=false;
+        if secure_available { let _=writer.send(&ClientMessage::SecureInput {request:secure.start(false)}).await; }
         let mut audio: Option<AudioReceiver> = None;
         let mut mic: Option<MicSender> = None;
         let mut pending_pair: Option<(String, std::sync::mpsc::Sender<Result<(), String>>)> = None;
@@ -698,12 +718,36 @@ impl Supervisor {
                 local_watch = Some(tokio::spawn(watch_local_clipboard(self.inner.clone(), writer.clone(), self.own_clipboard.clone(), self.observer.clone())));
             }
         }
-        let ended = loop {
+        let ended = 'connection: loop {
             tokio::select! {
                 command = rx.recv() => {
                     let Some(command) = command else { break Ended::Closed };
                     match command {
+                        Command::NormalKeyboard => {
+                            if let Ok(Some(requests))=secure.input(crate::secure_input::Input::Release) {
+                                for request in requests {let _=writer.send(&ClientMessage::SecureInput {request}).await;}
+                            }
+                            if secure.use_normal_keyboard().is_ok() {
+                                secure_available=false;secure_restart=false;
+                                self.emit(SessionEvent::Notice {code:"secure_input_normal".into(),message:"Normal keyboard mode. Secure-screen input is unavailable.".into()});
+                            } else {self.emit(SessionEvent::Notice {code:"secure_input_unavailable".into(),message:"Could not change keyboard mode.".into()});}
+                        }
+                        Command::SecureEnroll => {
+                            if info.trusted && secure_input {
+                                secure_available=true;secure_restart=false;secure_retry_at=Instant::now();
+                                let _=writer.send(&ClientMessage::SecureInput {request:secure.start(true)}).await;
+                            } else {self.emit(SessionEvent::Notice {code:"secure_input_unavailable".into(),message:"This server does not support secure-screen enrollment.".into()});}
+                        }
+                        Command::SecureConfirm(code) => {
+                            match secure.confirm(&code) {
+                                Ok(request)=>{let _=writer.send(&ClientMessage::SecureInput {request}).await;},
+                                Err(_)=>self.emit(SessionEvent::Notice {code:"secure_input_unavailable".into(),message:"Secure enrollment expired or changed. Start again.".into()}),
+                            }
+                        }
                         Command::Close => {
+                            if let Ok(Some(requests))=secure.input(crate::secure_input::Input::Release) {
+                                for request in requests {let _=writer.send(&ClientMessage::SecureInput {request}).await;}
+                            }
                             let _ = writer.send(&ClientMessage::ReleaseAll).await;
                             break Ended::Closed;
                         }
@@ -728,6 +772,18 @@ impl Supervisor {
                         Command::Send(message) => {
                             if !info.trusted {
                                 continue;
+                            }
+                            if let Some(input)=crate::secure_input::Input::from_message(&message) {
+                                match secure.input(input) {
+                                    Ok(Some(requests))=>{
+                                        for request in requests {
+                                            if let Err(e)=writer.send(&ClientMessage::SecureInput {request}).await {break 'connection Ended::Lost(e.to_string());}
+                                        }
+                                        continue;
+                                    }
+                                    Err(_)=>{self.emit(SessionEvent::Notice {code:"secure_input_unavailable".into(),message:"Secure-screen input is unavailable for this device.".into()});continue;}
+                                    Ok(None)=>{},
+                                }
                             }
                             let sent = match message {
                                 ClientMessage::AudioStart { .. } => {
@@ -761,6 +817,11 @@ impl Supervisor {
                         }
                     }
                 }
+                _ = secure_poll.tick(), if secure_available => {
+                    if Instant::now()<secure_retry_at {continue;}
+                    let request=if secure_restart {secure_restart=false;secure.start(false)}else{crate::secure_input::RelayRequest::Status};
+                    if let Err(e)=writer.send(&ClientMessage::SecureInput {request}).await {break Ended::Lost(e.to_string());}
+                }
                 message = msg_rx.recv() => {
                     last_heard = Instant::now();
                     let message = match message {
@@ -769,6 +830,26 @@ impl Supervisor {
                         None => break Ended::Lost("connection closed".into()),
                     };
                     match message {
+                        ServerMessage::SecureInput {reply} => {
+                            if !secure_available {continue;}
+                            let was_ready=secure.ready();
+                            match secure.receive(reply) {
+                                Ok((next,comparison))=>{
+                                    if let Some(request)=next {writer.send(&ClientMessage::SecureInput {request}).await.ok();}
+                                    if let Some(message)=comparison {self.emit(SessionEvent::Notice {code:"secure_input_compare".into(),message});}
+                                    if secure.ready() && !was_ready {secure_unavailable_reported=false;self.emit(SessionEvent::Notice {code:"secure_input_ready".into(),message:"Secure-screen input is ready.".into()});}
+                                }
+                                Err(_)=>{
+                                    secure_available=secure.requires_secure();secure_restart=secure_available;secure_retry_at=Instant::now()+Duration::from_secs(2);
+                                    // Drop all encryption state after a failure. Do not forward the rejected input in plaintext.
+                                    secure=crate::secure_input::Device::new(self.identity.private,&self.inner.store_dir,&info.id);
+                                    if !secure_unavailable_reported {
+                                        secure_unavailable_reported=true;
+                                        self.emit(SessionEvent::Notice {code:"secure_input_unavailable".into(),message:"Secure-screen input is unavailable. Enrolled devices pause keyboard input until the protected session returns.".into()});
+                                    }
+                                }
+                            }
+                        }
                         ServerMessage::Paired { proof: server_proof } => {
                             let Some((code, reply)) = pending_pair.take() else { continue };
                             let expected = proof(&code, "server", &hash);
@@ -814,7 +895,17 @@ impl Supervisor {
                                 self.emit(SessionEvent::Error { code, message });
                             }
                         }
-                        ServerMessage::Notice { code, message } => self.emit(SessionEvent::Notice { code, message }),
+                        ServerMessage::Notice { code, message } => {
+                            // Comparison prompts are generated only from the device's
+                            // inner handshake. The outer app must never spoof one.
+                            if code=="secure_input_unavailable" {
+                                secure_available=secure.requires_secure();secure_restart=secure_available;secure_retry_at=Instant::now()+Duration::from_secs(2);
+                                secure=crate::secure_input::Device::new(self.identity.private,&self.inner.store_dir,&info.id);
+                                if !secure_unavailable_reported {secure_unavailable_reported=true;self.emit(SessionEvent::Notice {code,message:"Secure-screen input is unavailable. Enrolled devices pause keyboard input until the protected session returns.".into()});}
+                            } else if remote_notice_allowed(&code) {
+                                self.emit(SessionEvent::Notice {code,message});
+                            }
+                        },
                         ServerMessage::AudioReady { port, key, sample_rate, channels, frames, turn } => {
                             audio = None;
                             let turn = match (turn.and_then(|t| t.parse::<SocketAddr>().ok()), audio_turn.take()) {
@@ -1544,5 +1635,15 @@ pub fn probe(store_dir: &std::path::Path, id: &str) -> Reachability {
     match known.relay.as_ref().map(crate::relay::status) {
         Some(Ok(true)) => Reachability::Relay,
         _ => Reachability::NotReachable,
+    }
+}
+
+fn remote_notice_allowed(code:&str)->bool { !code.starts_with("secure_input_") }
+
+#[cfg(test)] mod secure_notice_tests {
+    #[test] fn outer_server_cannot_spoof_enrollment_confirmation() {
+        assert!(!super::remote_notice_allowed("secure_input_compare"));
+        assert!(!super::remote_notice_allowed("secure_input_ready"));
+        assert!(super::remote_notice_allowed("input_permission"));
     }
 }

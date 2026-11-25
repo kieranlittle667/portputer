@@ -14,6 +14,7 @@ pub mod platform;
 pub mod protocol;
 pub mod relay;
 pub mod server;
+pub mod secure_input;
 pub mod transport;
 pub mod turn;
 pub mod udp;

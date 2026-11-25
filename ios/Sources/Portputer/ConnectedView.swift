@@ -6,9 +6,12 @@ struct ConnectedView: View {
     @EnvironmentObject var connection: Connection
     @Binding var path: [Route]
     @State private var code = ""
+    @State private var normalKeyboard = false
     @State private var pairing = false
     @State private var typing = false
     @State private var text = ""
+
+    private var securePrompt: Binding<Bool> { Binding(get: { connection.secureComparison != nil }, set: { if !$0 { connection.secureComparison = nil } }) }
 
     var body: some View {
         Form {
@@ -33,6 +36,18 @@ struct ConnectedView: View {
                     path = []
                 }
             }
+        }
+        .confirmationDialog("Use Normal Keyboard Only?", isPresented: $normalKeyboard, titleVisibility: .visible) {
+            Button("Use Normal Keyboard Only") { connection.useNormalKeyboard() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Secure-screen input will be unavailable. Ordinary input can be read by the Windows application.")
+        }
+        .alert("Allow Secure Screens", isPresented: securePrompt) {
+            Button("Numbers Match") { connection.confirmSecureInput() }
+            Button("Cancel", role: .cancel) { connection.secureComparison = nil }
+        } message: {
+            Text("Compare this number with the administrator window on the Windows computer: " + (connection.secureComparison ?? "").map(String.init).joined(separator: " ") + ". Only confirm if both numbers match.")
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
@@ -106,6 +121,10 @@ struct ConnectedView: View {
     @ViewBuilder
     private func controls(_ info: ServerInfo) -> some View {
         Section {
+            if info.os == "windows" {
+                Button("Allow Secure Screens") { connection.beginSecureEnrollment() }
+                Button("Use Normal Keyboard Only") { connection.sendKeyboard = false; normalKeyboard = true }
+            }
             Toggle("Send Keyboard to Computer", isOn: $connection.sendKeyboard)
             Text(connection.sendKeyboard
                  ? "Keys from the hardware keyboard go to \(info.name) while Portputer is open. iOS keeps its own shortcuts, such as Command-Tab, and VoiceOver's keyboard commands while VoiceOver is on."

@@ -1366,7 +1366,6 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation",
- "portputer-windows-input",
  "rand_core 0.10.1",
  "rustls",
  "serde",
@@ -1410,8 +1409,14 @@ dependencies = [
 name = "portputer-windows-input"
 version = "0.1.2"
 dependencies = [
+ "base64",
+ "getrandom 0.4.3",
+ "hex",
+ "portputer-core",
+ "ring",
  "serde",
  "serde_json",
+ "tokio",
  "windows-service",
  "windows-sys 0.61.2",
 ]

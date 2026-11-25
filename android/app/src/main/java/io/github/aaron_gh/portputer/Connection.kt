@@ -45,6 +45,11 @@ object Connection {
     @Volatile var state: State = State.Idle
         private set
     @Volatile private var session: ClientSession? = null
+    private var secureComparison: String? = null
+    fun useNormalKeyboard() { secureComparison = null; session?.useNormalKeyboard() }
+    fun beginSecureEnrollment() { session?.beginSecureEnrollment() }
+    fun takeSecureComparison(): String? = secureComparison.also { secureComparison = null }
+    fun confirmSecureInput(comparison: String) { session?.confirmSecureInput(comparison) }
     private var generation = 0
 
     /** Keys from the external keyboard go to the computer. */
@@ -325,7 +330,13 @@ object Connection {
             ConnectionService.stop(app)
         }
 
-        override fun notice(code: String, message: String) = post { say(message) }
+        override fun notice(code: String, message: String) = post {
+            if (code == "secure_input_compare") {
+                setCapturing(false)
+                secureComparison = message
+                changed()
+            } else say(message)
+        }
 
         override fun error(code: String, message: String) = post {
             if (code == "audio_failed") {

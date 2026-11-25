@@ -196,6 +196,18 @@
                     android:text="@string/text_button" />
 
                 <Button
+                    android:id="@+id/normal_keyboard"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/normal_keyboard" />
+
+                <Button
+                    android:id="@+id/secure_enroll"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/secure_enroll" />
+
+                <Button
                     android:id="@+id/power"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"

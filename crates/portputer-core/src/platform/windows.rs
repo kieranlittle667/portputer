@@ -16,21 +16,15 @@ pub struct WinInjector {
 }
 
 impl WinInjector {
+    /// Forget state after a desktop switch; never send releases to the new desktop.
+    pub fn discard_held(&mut self) { self.held.take(); }
+
     pub fn new(_session: SessionKind) -> WinInjector {
         WinInjector { held: Held::default() }
     }
 }
 
 fn send(inputs: &[KEYBDINPUT]) -> bool {
-    // The optional local broker is installed separately with administrator
-    // consent. Pairing and remote/network traffic stay in this user process.
-    let events: Vec<_> = inputs.iter().map(|k| portputer_windows_input::KeyInput {
-        vk: k.wVk, scan: k.wScan, flags: k.dwFlags,
-    }).collect();
-    if let Some(result) = portputer_windows_input::win::try_send(&events) {
-        if !result { tracing::warn!("secure input broker rejected an input batch"); }
-        return result; // Never replay a partially injected batch on another desktop.
-    }
     let inputs: Vec<INPUT> = inputs
         .iter()
         .map(|ki| INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: *ki } })

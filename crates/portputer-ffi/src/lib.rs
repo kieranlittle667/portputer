@@ -495,6 +495,12 @@ impl ClientSession {
         self.session.text(&text);
     }
 
+    pub fn use_normal_keyboard(&self) {self.session.use_normal_keyboard();}
+
+    pub fn begin_secure_enrollment(&self) { self.session.begin_secure_enrollment(); }
+
+    pub fn confirm_secure_input(&self, comparison: String) { self.session.confirm_secure_input(&comparison); }
+
     pub fn release_all(&self) {
         self.session.release_all();
     }

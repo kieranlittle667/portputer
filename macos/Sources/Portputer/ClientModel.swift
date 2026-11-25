@@ -58,6 +58,13 @@ final class ClientModel: ObservableObject {
     /// Use Internet Relay: off for each connection.
     @Published private(set) var useRelay = false
     @Published private(set) var relayAvailable = false
+    @Published var secureComparison: String?
+    func useNormalKeyboard() { secureComparison = nil; session?.useNormalKeyboard() }
+    func beginSecureEnrollment() { session?.beginSecureEnrollment() }
+    func confirmSecureInput() {
+        if let comparison = secureComparison { session?.confirmSecureInput(comparison: comparison) }
+        secureComparison = nil
+    }
     @Published var message = ""
     @Published var volume: Double = UserDefaults.standard.object(forKey: "clientVolume") as? Double ?? 1 {
         didSet {
@@ -368,7 +375,10 @@ final class ClientModel: ObservableObject {
             }
         }
 
-        func notice(code: String, message: String) { onMain { $0.message = message } }
+        func notice(code: String, message: String) { onMain { m in
+            if code == "secure_input_compare" { m.setCapturing(false); m.secureComparison = message }
+            else { m.message = message }
+        } }
 
         func error(code: String, message: String) {
             onMain { m in

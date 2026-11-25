@@ -96,6 +96,7 @@ pub enum ClientMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         password: Option<String>,
     },
+    SecureInput { request: crate::secure_input::RelayRequest },
     Ping { n: u64 },
 }
 
@@ -123,6 +124,8 @@ pub enum ServerMessage {
         /// Clipboard and file transfer are available.
         #[serde(default)]
         files: bool,
+        #[serde(default)]
+        secure_input: bool,
     },
     /// The server's half of the pairing proof: "server" and the handshake
     /// hash.
@@ -166,6 +169,7 @@ pub enum ServerMessage {
     ClipboardText { text: String },
     /// Files copied on the server; fetched over a transfer connection.
     ClipboardFiles { files: Vec<FileInfo> },
+    SecureInput { reply: crate::secure_input::RelayReply },
     Pong { n: u64 },
 }
 

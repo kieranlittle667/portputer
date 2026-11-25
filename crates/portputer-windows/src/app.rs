@@ -56,6 +56,8 @@ mod id {
     pub const POWER: u16 = 309;
     pub const DISCONNECT: u16 = 310;
     pub const RELEASE_ALL: u16 = 311;
+    pub const SECURE_ENROLL: u16 = 316;
+    pub const NORMAL_KEYBOARD: u16 = 317;
     pub const QUIT: u16 = 401;
     pub const CHECK_UPDATES: u16 = 402;
     pub const TRAY_OPEN: u16 = 501;
@@ -108,6 +110,8 @@ struct Controls {
     keys: HWND,
     power: HWND,
     release_all: HWND,
+    secure_enroll: HWND,
+    normal_keyboard: HWND,
     send_files: HWND,
     text_label: HWND,
     text: HWND,
@@ -251,18 +255,9 @@ pub(crate) fn secure_input_finished(on: bool, success: bool) {
     with_app(|a| {
         a.secure_busy = false;
         a.refresh();
-        if success {
-            let destination=crate::secure_input::destination(on);
-            let restart=destination.as_ref().is_some_and(|p| std::env::current_exe().ok().as_ref()!=Some(p));
-            if restart {
-                match crate::secure_input::relaunch(on) {
-                    Ok(())=>unsafe{let _=PostMessageW(Some(a.hwnd),WM_COMMAND,WPARAM(id::QUIT as usize),LPARAM(0));},
-                    Err(e)=>speech::status(a.c.secure_status,&e),
-                }
-            } else {
-                speech::status(a.c.secure_status,if on{"Windows secure-screen access is enabled."}else{"Windows secure-screen access is disabled."});
-            }
-        } else { speech::status(a.c.secure_status,"Could not change secure screen access. Windows administrator permission is required."); }
+        speech::status(a.c.secure_status, if success {
+            if on {"On the controlling device, choose Allow Secure Screens and compare the numbers in the administrator window."} else {"Secure-screen access is disabled. Device authorizations were removed."}
+        } else {"Secure-screen setup was cancelled, timed out, or failed."});
     });
 }
 
@@ -298,9 +293,11 @@ impl App {
             server_heading: l("This computer"),
             accept: ui::checkbox(hwnd, "Accept connections from paired devices", id::ACCEPT),
             startup: ui::checkbox(hwnd, "Start at login", id::STARTUP),
+            normal_keyboard: ui::button(hwnd,"Use Normal Keyboard Only",id::NORMAL_KEYBOARD),
+            secure_enroll: ui::button(hwnd, "Allow Secure Screens", id::SECURE_ENROLL),
             secure_input: ui::checkbox(hwnd, "Allow on Windows secure screens", id::SECURE_INPUT),
             secure_status: l(""),
-            secure_update: ui::button(hwnd, "Update secure-screen support", id::SECURE_UPDATE),
+            secure_update: ui::button(hwnd, "Allow another device on secure screens", id::SECURE_UPDATE),
             server_status: l(""),
             pair_new: ui::button(hwnd, "Pair New Device", id::PAIR_NEW),
             code_label: l("Pairing code"),
@@ -368,7 +365,7 @@ impl App {
         f.row(&[(c.accept, 2), (c.startup, 1)], h);
         f.row(&[(c.secure_input, 1)], h);
         f.row(&[(c.secure_status, 1)], h);
-        if crate::secure_input::enabled() && !crate::secure_input::protected() {f.row(&[(c.secure_update,1)],h+4);}
+        if crate::secure_input::enabled() {f.row(&[(c.secure_update,1)],h+4);}
         f.row(&[(c.server_status, 1)], h);
         f.row(&[(c.pair_new, 1), (c.code_label, 1), (c.code, 2)], h + 2);
         f.row(&[(c.paired_label, 1)], h);
@@ -386,7 +383,7 @@ impl App {
         f.row(&[(c.connect_address, 1)], h + 4);
         f.row(&[(c.pair_label, 1)], h);
         f.row(&[(c.pair_code, 3), (c.pair, 1)], h + 2);
-        f.row(&[(c.capture, 1)], h);
+        f.row(&[(c.capture, 1), (c.secure_enroll, 1), (c.normal_keyboard,1)], h);
         f.row(&[(c.audio, 1), (c.mute_speakers, 1), (c.mic, 1)], h);
         f.row(&[(c.use_relay, 1)], h);
         f.row(&[(c.volume_label, 1), (c.volume, 3)], 30);
@@ -408,7 +405,7 @@ impl App {
         }
         ui::enable(c.secure_input,!self.secure_busy);
         ui::enable(c.secure_update,!self.secure_busy);
-        ui::show(c.secure_update,crate::secure_input::enabled()&&!crate::secure_input::protected());
+        ui::show(c.secure_update,crate::secure_input::enabled());
         let running = self.server.is_some();
         ui::set_checked(c.accept, running);
         ui::enable(c.pair_new, running);
@@ -442,6 +439,10 @@ impl App {
             ui::show(h, info.as_ref().is_some_and(|i| i.trusted));
             ui::enable(h, trusted);
         }
+        ui::show(c.secure_enroll, info.as_ref().is_some_and(|i|i.trusted && i.os==Os::Windows));
+        ui::enable(c.secure_enroll,trusted);
+        ui::show(c.normal_keyboard,info.as_ref().is_some_and(|i|i.trusted && i.os==Os::Windows));
+        ui::enable(c.normal_keyboard,trusted);
         ui::show(c.disconnect, !idle);
         if let Some(i) = &info {
             ui::enable(c.audio, trusted && i.audio);
@@ -530,6 +531,7 @@ impl App {
             observer: Some(Arc::new(ServerEvents)),
         }) {
             Ok(s) => {
+                s.set_secure_input_relay(Arc::new(portputer_windows_input::win::PipeRelay));
                 ui::set_text(self.c.server_status, &format!("Server on, port {}.", s.port()));
                 self.server = Some(s);
             }
@@ -659,7 +661,15 @@ impl App {
                 self.say(&format!("Disconnected. {reason}"));
                 self.refresh();
             }
-            SessionEvent::Notice { message, .. } => self.say(&message),
+            SessionEvent::Notice { code, message } => {
+                if code=="secure_input_compare" {
+                    self.set_capturing(false);
+                    let text=format!("Compare this number with the administrator window on the Windows computer:\n\n{}\n\nDo both numbers match?",message.chars().map(|c|c.to_string()).collect::<Vec<_>>().join(" "));
+                    if unsafe {MessageBoxW(Some(self.hwnd),PCWSTR(ui::wide(&text).as_ptr()),PCWSTR(ui::wide("Allow Secure Screens").as_ptr()),MB_YESNO|MB_DEFBUTTON2|MB_ICONWARNING)}==IDYES {
+                        if let Some(session)=&self.session {session.confirm_secure_input(&message);}
+                    }
+                } else {self.say(&message);}
+            },
             SessionEvent::Error { code, message } => {
                 if code == "audio_failed" {
                     self.audio_wanted = false;
@@ -825,12 +835,19 @@ impl App {
                 if ui::checked(self.c.accept) { self.start_server() } else { self.stop_server() }
                 self.refresh();
             }
+            id::NORMAL_KEYBOARD => {
+                self.set_capturing(false);
+                if unsafe{MessageBoxW(Some(self.hwnd),PCWSTR(ui::wide("Use normal keyboard input only? Secure-screen input will be unavailable. Ordinary input can be read by the Windows application.").as_ptr()),PCWSTR(ui::wide("Use Normal Keyboard Only").as_ptr()),MB_YESNO|MB_DEFBUTTON2|MB_ICONWARNING)}==IDYES {
+                    if let Some(session)=&self.session {session.use_normal_keyboard();}
+                }
+            }
+            id::SECURE_ENROLL => {if let Some(session)=&self.session {session.begin_secure_enrollment();}},
             id::STARTUP => set_start_at_login(ui::checked(self.c.startup)),
             id::SECURE_INPUT | id::SECURE_UPDATE => {
                 let on=control==id::SECURE_UPDATE || ui::checked(self.c.secure_input);
                 self.set_capturing(false);
                 match crate::secure_input::request(self.hwnd,on) {
-                    Ok(true)=>{self.secure_busy=true;ui::enable(self.c.secure_input,false);ui::enable(self.c.secure_update,false);speech::status(self.c.secure_status,"Changing secure screen access...");},
+                    Ok(true)=>{self.secure_busy=true;ui::enable(self.c.secure_input,false);ui::enable(self.c.secure_update,false);speech::status(self.c.secure_status,"On the controlling device, choose Allow Secure Screens. Compare the numbers in both windows.");},
                     Ok(false)=>self.refresh(),
                     Err(e)=>{self.refresh();speech::status(self.c.secure_status,&e);},
                 }
@@ -1189,7 +1206,6 @@ pub fn run() {
         ui::set_main_window(hwnd);
         crate::updates::start(VERSION);
         let controls = App::create_controls(hwnd);
-        if starts_at_login() {set_start_at_login(true);}
         ui::set_checked(controls.startup, starts_at_login());
         let browser = Browser::start(|event| {
             ui::run_on_ui(move || {
