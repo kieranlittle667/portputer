@@ -11,7 +11,9 @@ pub enum Request {
     Approve { hash: Vec<u8> },
     CancelEnrollment,
     Disable,
-    Update { package: String, signature: String },
+    UpdateBegin { size: u64, signature: String },
+    UpdateChunk { bytes: Vec<u8> },
+    UpdateFinish,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

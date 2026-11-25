@@ -554,6 +554,7 @@ struct State {
     enrollment: Option<Enrollment>,
     active: HashMap<u64, Active>,
     next: u64,
+    upload: Option<(u64, portputer_windows_input::update::Upload)>,
 }
 fn create_pipe(name: &str, first: bool) -> io::Result<NamedPipeServer> {
     unsafe {
@@ -624,6 +625,7 @@ fn worker(parent_pid: u32, stop_name: &str) -> io::Result<()> {
         enrollment: None,
         active: HashMap::new(),
         next: 1,
+        upload: None,
     }));
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     let handles = [parent as usize, stop as usize];
@@ -729,6 +731,9 @@ async fn serve_pipe(
     }
     .await;
     let mut state = state.borrow_mut();
+    if state.upload.as_ref().is_some_and(|(owner, _)| *owner == id) {
+        state.upload = None;
+    }
     if let Some(mut active) = state.active.remove(&id) {
         release(&mut active.injector);
     }
@@ -747,6 +752,13 @@ fn handle_request(
     allow_enroll: &mut bool,
 ) -> Result<Reply> {
     let mut state = state.borrow_mut();
+    if state
+        .upload
+        .as_ref()
+        .is_some_and(|(_, upload)| upload.expired())
+    {
+        state.upload = None;
+    }
     if state
         .enrollment
         .as_ref()
@@ -810,10 +822,29 @@ fn handle_request(
                 release(&mut active.injector);
             }
         }
-        Request::Update { package, signature } => {
-            // Unprivileged requests can only stage an independently signed,
-            // strictly newer official package, never choose an executable.
-            portputer_windows_input::update::stage(&package, &signature)?;
+        Request::UpdateBegin { size, signature } => {
+            if state.upload.is_some() {
+                return Err("an update upload is already in progress".into());
+            }
+            state.upload = Some((
+                id,
+                portputer_windows_input::update::Upload::begin(size, signature)?,
+            ));
+        }
+        Request::UpdateChunk { bytes } => {
+            let (_, upload) = state
+                .upload
+                .as_mut()
+                .filter(|(owner, _)| *owner == id)
+                .ok_or("no package upload for this connection")?;
+            upload.push(&bytes)?;
+        }
+        Request::UpdateFinish => {
+            if !state.upload.as_ref().is_some_and(|(owner, _)| *owner == id) {
+                return Err("no package upload for this connection".into());
+            }
+            let (_, upload) = state.upload.take().unwrap();
+            upload.finish()?;
         }
         Request::Relay { request } => {
             let secure = secure_desktop();
@@ -1013,6 +1044,7 @@ mod tests {
             enrollment: None,
             active: HashMap::new(),
             next: 1,
+            upload: None,
         });
         for request in [
             Request::BeginEnrollment,
@@ -1029,11 +1061,34 @@ mod tests {
         assert!(state.borrow().active.is_empty());
     }
     #[test]
+    fn update_chunks_require_a_live_upload_owned_by_the_connection() {
+        let state = RefCell::new(State {
+            enrollment: None,
+            active: HashMap::new(),
+            next: 1,
+            upload: None,
+        });
+        for request in [
+            Request::UpdateChunk { bytes: vec![0] },
+            Request::UpdateFinish,
+            Request::UpdateBegin {
+                size: 0,
+                signature: "invalid".into(),
+            },
+        ] {
+            assert!(
+                handle_request(request, false, 1, &state, &[0; 32], &mut None, &mut false).is_err()
+            );
+        }
+        assert!(state.borrow().upload.is_none());
+    }
+    #[test]
     fn enrollment_cannot_open_without_elevated_window() {
         let state = RefCell::new(State {
             enrollment: None,
             active: HashMap::new(),
             next: 1,
+            upload: None,
         });
         let request = Request::Relay {
             request: RelayRequest::Open {
@@ -1051,6 +1106,7 @@ mod tests {
             enrollment: None,
             active: HashMap::new(),
             next: 1,
+            upload: None,
         });
         handle_request(
             Request::BeginEnrollment,

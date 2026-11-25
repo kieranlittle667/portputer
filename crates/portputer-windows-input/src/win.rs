@@ -183,6 +183,28 @@ impl Connection {
         }
         Ok(Self { runtime, pipe })
     }
+    /// Called by the ordinary app's update integration. The download is opened
+    /// with this process's permissions and sent as bounded bytes, never a path.
+    pub fn install_update(&mut self, path: &Path, signature: &str) -> io::Result<()> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        self.request(&Request::UpdateBegin {
+            size: file.metadata()?.len(),
+            signature: signature.into(),
+        })?;
+        let mut bytes = [0u8; 8192];
+        loop {
+            let n = file.read(&mut bytes)?;
+            if n == 0 {
+                break;
+            }
+            self.request(&Request::UpdateChunk {
+                bytes: bytes[..n].to_vec(),
+            })?;
+        }
+        self.request(&Request::UpdateFinish)?;
+        Ok(())
+    }
     pub fn request(&mut self, request: &Request) -> io::Result<Reply> {
         let bytes = serde_json::to_vec(request)?;
         if bytes.len() > MAX_FRAME * 5 {
