@@ -65,8 +65,9 @@ One window, and an icon in the notification area. The window title shows the ver
 - The server for paired devices, Start at login, Pair New Device, and paired devices.
 - Computers on the network, Connect by Address, and the connected computer's controls: Send keyboard to computer (until Control-Windows-Escape), Computer audio, Send microphone, Use internet relay, Keys and Shortcuts, Power, Type, Send Files.
 - With NVDA, status changes are spoken through NVDA.
+- **Optional Windows secure-screen input (under review):** a separate helper package and device enrollment support the lock screen and UAC prompts in an existing signed-in session. UAC policy is unchanged. See [Windows secure-screen input](windows/SECURE-INPUT.md) for setup, keyboard modes, security boundaries and current release-integration gaps.
 
-Not available on Windows: the Portputer Microphone input, typing before login, and Restart Without Disk Unlock (BitLocker).
+Not available on Windows: the Portputer Microphone input, typing before the first sign-in after a restart, and Restart Without Disk Unlock (BitLocker).
 
 ## Reaching a computer from anywhere
 

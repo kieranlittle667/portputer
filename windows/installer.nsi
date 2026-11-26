@@ -67,11 +67,7 @@ VIAddVersionKey "LegalCopyright" "Apache License 2.0"
 Section "Install"
     !insertmacro WaitForPortputerToQuit
     SetOutPath "$INSTDIR"
-    !ifdef NSIS_WIN32_MAKENSIS
-        File /r "${STAGE}\*"
-    !else
-        File /r "${STAGE}/*"
-    !endif
+    File /r "${STAGE}/*"
     WriteUninstaller "$INSTDIR\Uninstall.exe"
 
     CreateShortcut "$SMPROGRAMS\${NAME}.lnk" "$INSTDIR\${EXE}"

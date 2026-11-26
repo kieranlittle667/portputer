@@ -64,8 +64,9 @@ final class Connection: ObservableObject {
     @Published var secureComparison: String?
     func useNormalKeyboard() { secureComparison = nil; session?.useNormalKeyboard() }
     func beginSecureEnrollment() { session?.beginSecureEnrollment() }
-    func confirmSecureInput() {
-        if let comparison = secureComparison { session?.confirmSecureInput(comparison: comparison) }
+    func confirmSecureInput(comparison: String) {
+        guard secureComparison == comparison else { return }
+        session?.confirmSecureInput(comparison: comparison)
         secureComparison = nil
     }
     @Published var message = ""
@@ -418,6 +419,7 @@ final class Connection: ObservableObject {
         func reconnecting() {
             onMain { c in
                 guard let info = c.info else { return }
+                c.secureComparison = nil
                 c.state = .reconnecting(info)
                 c.audioOn = false
                 c.held = []
@@ -430,6 +432,7 @@ final class Connection: ObservableObject {
                 if case .connecting(let t) = c.state { name = t.name } else { name = c.info?.name ?? "" }
                 c.clipboard?.stop()
                 c.clipboard = nil
+                c.secureComparison = nil
                 c.session = nil
                 c.resetMedia()
                 c.state = .closed(name: name, reason: "Disconnected from \(name). \(reason)")
@@ -438,7 +441,13 @@ final class Connection: ObservableObject {
 
         func notice(code: String, message: String) { onMain { m in
             if code == "secure_input_compare" { m.sendKeyboard = false; m.secureComparison = message }
-            else { m.message = message }
+            else {
+                if code.hasPrefix("secure_input_") {
+                    if code != "secure_input_paused" { m.secureComparison = nil }
+                    if m.message != message { announce(message) }
+                }
+                m.message = message
+            }
         } }
 
         func error(code: String, message: String) {

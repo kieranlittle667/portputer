@@ -48,8 +48,12 @@ pub fn entry() -> Result<()> {
         Some("--install") => setup::install()?,
         Some("--uninstall") => setup::uninstall()?,
         Some("--enroll") => {
-            setup::enable()?;
-            enroll_ui()?;
+            let owner = args
+                .windows(2)
+                .find(|pair| pair[0] == "--owner")
+                .and_then(|pair| pair[1].parse::<usize>().ok())
+                .map_or(std::ptr::null_mut(), |value| value as HWND);
+            enroll_ui(owner)?;
         }
         Some("--disable") => {
             setup::disable()?;
@@ -97,14 +101,21 @@ fn status(state: ServiceState) -> ServiceStatus {
 struct Child {
     process: HANDLE,
     stop: HANDLE,
+    discovery: std::path::PathBuf,
 }
 impl Drop for Child {
     fn drop(&mut self) {
         unsafe {
             SetEvent(self.stop);
-            if WaitForSingleObject(self.process, 10_000) != WAIT_OBJECT_0 {
+            let mut exited = WaitForSingleObject(self.process, 10_000) == WAIT_OBJECT_0;
+            if !exited {
                 TerminateProcess(self.process, 1);
-                WaitForSingleObject(self.process, 5_000);
+                exited = WaitForSingleObject(self.process, 5_000) == WAIT_OBJECT_0;
+            }
+            // Sign-out can terminate a worker before its own cleanup runs.
+            // Reap its publication only after confirming that process exited.
+            if exited {
+                let _ = std::fs::remove_file(&self.discovery);
             }
             CloseHandle(self.stop);
             CloseHandle(self.process);
@@ -149,6 +160,7 @@ fn run_service() -> Result<()> {
                 }
                 retry.1 = (retry.1 + 1).min(6);
                 retry.0 = Instant::now() + Duration::from_secs(1 << retry.1);
+                let discovery = data_dir()?.join("Sessions").join(format!("{session}.json"));
                 let mut random = [0; 16];
                 getrandom::fill(&mut random).map_err(io::Error::other)?;
                 let name = format!(r"Global\PortputerSecureInputStop-{}", hex::encode(random));
@@ -158,7 +170,14 @@ fn run_service() -> Result<()> {
                 }
                 match spawn_worker(session, &name) {
                     Ok(process) => {
-                        children.insert(session, Child { process, stop });
+                        children.insert(
+                            session,
+                            Child {
+                                process,
+                                stop,
+                                discovery,
+                            },
+                        );
                     }
                     Err(_) => unsafe {
                         CloseHandle(stop);
@@ -248,8 +267,8 @@ fn owner_sessions() -> Vec<u32> {
             if WTSQueryUserToken(s.SessionId, &mut token) == 0 {
                 continue;
             }
-            // User tokens are used only to establish the owner, never passed to
-            // the broker or retained. Read TOKEN_USER and compare the SID.
+            // Check that this is a logged-in user session. The token is never
+            // passed to the worker or retained.
             let mut size = 0;
             GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size);
             let mut data = vec![0u64; (size as usize).div_ceil(8)];
@@ -780,12 +799,17 @@ fn handle_request(
             });
         }
         Request::Pending if admin => {
-            if let Some(enrollment) = state.enrollment.as_ref().filter(|e| e.owner == id) {
-                if let Some(active) = enrollment
-                    .pending
-                    .and_then(|id| state.active.get(&id))
-                    .filter(|a| !a.auth.trusted())
-                {
+            let enrollment = state
+                .enrollment
+                .as_ref()
+                .filter(|e| e.owner == id)
+                .ok_or("enrollment expired or cancelled")?;
+            if let Some(pending) = enrollment.pending {
+                let active = state
+                    .active
+                    .get(&pending)
+                    .ok_or("enrollment connection closed")?;
+                if !active.auth.trusted() {
                     reply.pending = Some(Pending {
                         hash: active.auth.channel.hash.clone(),
                         comparison: active.auth.channel.comparison(),
@@ -989,50 +1013,291 @@ fn handle_request(
     }
     Ok(reply)
 }
-fn enroll_ui() -> Result<()> {
-    // This process runs elevated from the protected package. The ordinary
-    // application cannot confirm by clicking this high-integrity dialog.
+// UI and pipe work use separate threads: slow or failed service requests must
+// not delay the elevated window, keyboard navigation, painting or cancellation.
+enum EnrollmentAction {
+    Approve,
+    Cancel,
+}
+enum EnrollmentUpdate {
+    Pending(String),
+    Approved,
+    Complete,
+    Failed(String),
+}
+struct EnrollmentWindow {
+    hwnd: HWND,
+    _actions: Box<std::sync::mpsc::Sender<EnrollmentAction>>,
+}
+const ENROLL_APPROVE: usize = 1001;
+const ENROLL_MESSAGE: i32 = 1002;
+unsafe extern "system" fn enrollment_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+) -> isize {
+    unsafe {
+        if msg == WM_INITDIALOG {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, l);
+            return 1;
+        }
+        let actions = GetWindowLongPtrW(hwnd, GWLP_USERDATA)
+            as *const std::sync::mpsc::Sender<EnrollmentAction>;
+        if msg == WM_CLOSE || (msg == WM_COMMAND && (w & 0xffff) == IDCANCEL as usize) {
+            if !actions.is_null() {
+                let _ = (*actions).send(EnrollmentAction::Cancel);
+            }
+            DestroyWindow(hwnd);
+            return 1;
+        }
+        if msg == WM_COMMAND && (w & 0xffff) == ENROLL_APPROVE {
+            if !actions.is_null() {
+                let _ = (*actions).send(EnrollmentAction::Approve);
+            }
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                GetDlgItem(hwnd, ENROLL_APPROVE as i32),
+                0,
+            );
+            return 1;
+        }
+        0
+    }
+}
+// DWORD-aligned standard dialog template with Segoe UI 9-point font.
+#[repr(C, align(4))]
+struct EnrollmentTemplate {
+    header: DLGTEMPLATE,
+    menu: u16,
+    class: u16,
+    title: u16,
+    point_size: u16,
+    font: [u16; 9],
+}
+impl EnrollmentWindow {
+    fn new(owner: HWND, actions: std::sync::mpsc::Sender<EnrollmentAction>) -> io::Result<Self> {
+        unsafe {
+            let instance =
+                windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+            let template = EnrollmentTemplate {
+                header: DLGTEMPLATE {
+                    style: WS_POPUP
+                        | WS_CAPTION
+                        | WS_SYSMENU
+                        | DS_MODALFRAME as u32
+                        | DS_CENTER as u32
+                        | DS_SETFONT as u32,
+                    dwExtendedStyle: WS_EX_TOPMOST,
+                    cdit: 0,
+                    x: 0,
+                    y: 0,
+                    cx: 260,
+                    cy: 130,
+                },
+                menu: 0,
+                class: 0,
+                title: 0,
+                point_size: 9,
+                font: [83, 101, 103, 111, 101, 32, 85, 73, 0],
+            };
+            let mut actions = Box::new(actions);
+            let owner = if IsWindow(owner) != 0 {
+                owner
+            } else {
+                std::ptr::null_mut()
+            };
+            let hwnd = CreateDialogIndirectParamW(
+                instance,
+                &template.header,
+                owner,
+                Some(enrollment_window_proc),
+                (&mut *actions as *mut std::sync::mpsc::Sender<EnrollmentAction>) as isize,
+            );
+            if hwnd.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            SetWindowTextW(hwnd, wide("Portputer: allow secure screens").as_ptr());
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                520,
+                260,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            let label = CreateWindowExW(0, wide("STATIC").as_ptr(),
+                wide("Starting secure-screen enrollment.\r\nWaiting for the controlling device.\r\nA comparison number will appear here after the handshake.").as_ptr(),
+                WS_CHILD | WS_VISIBLE, 20, 20, 470, 135, hwnd, ENROLL_MESSAGE as usize as _, instance, std::ptr::null());
+            let approve = CreateWindowExW(
+                0,
+                wide("BUTTON").as_ptr(),
+                wide("Numbers Match").as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_DISABLED,
+                230,
+                175,
+                150,
+                30,
+                hwnd,
+                ENROLL_APPROVE as _,
+                instance,
+                std::ptr::null(),
+            );
+            let cancel = CreateWindowExW(
+                0,
+                wide("BUTTON").as_ptr(),
+                wide("Cancel").as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+                395,
+                175,
+                90,
+                30,
+                hwnd,
+                IDCANCEL as usize as _,
+                instance,
+                std::ptr::null(),
+            );
+            if label.is_null() || approve.is_null() || cancel.is_null() {
+                DestroyWindow(hwnd);
+                return Err(io::Error::last_os_error());
+            }
+            let font = SendMessageW(hwnd, WM_GETFONT, 0, 0);
+            for control in [label, approve, cancel] {
+                SendMessageW(control, WM_SETFONT, font as usize, 1);
+            }
+            ShowWindow(hwnd, SW_SHOW);
+            windows_sys::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+            SetForegroundWindow(hwnd);
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(cancel);
+            Ok(Self {
+                hwnd,
+                _actions: actions,
+            })
+        }
+    }
+    fn message(&self, text: &str) {
+        unsafe {
+            SetWindowTextW(GetDlgItem(self.hwnd, ENROLL_MESSAGE), wide(text).as_ptr());
+        }
+    }
+    fn pending(&self, comparison: &str) {
+        self.message(&format!("Compare this number with the controlling device:\r\n\r\n{}\r\n\r\nChoose Numbers Match only if both numbers match. This grants access to the lock screen and UAC prompts.",
+            comparison.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")));
+        unsafe {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                GetDlgItem(self.hwnd, ENROLL_APPROVE as i32),
+                1,
+            );
+            SetForegroundWindow(self.hwnd);
+        }
+    }
+    fn open(&self) -> bool {
+        unsafe {
+            let mut message = std::mem::zeroed();
+            while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if IsDialogMessageW(self.hwnd, &message) == 0 {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            IsWindow(self.hwnd) != 0
+        }
+    }
+}
+impl Drop for EnrollmentWindow {
+    fn drop(&mut self) {
+        unsafe {
+            if IsWindow(self.hwnd) != 0 {
+                DestroyWindow(self.hwnd);
+            }
+        }
+        // The callback pointer is valid until DestroyWindow has returned.
+    }
+}
+fn enrollment_requests(
+    actions: std::sync::mpsc::Receiver<EnrollmentAction>,
+    updates: std::sync::mpsc::Sender<EnrollmentUpdate>,
+) -> Result<()> {
+    setup::enable()?;
     let mut connection = Connection::connect()?;
     connection.request(&Request::BeginEnrollment)?;
     let until = Instant::now() + Duration::from_secs(secure_input::ENROLL_SECONDS);
+    let mut pending: Option<Pending> = None;
+    let mut approved = false;
     while Instant::now() < until {
-        let pending = connection.request(&Request::Pending)?.pending;
-        if let Some(pending) = pending {
-            let text = format!(
-                "Compare this number with the controlling device:\n\n{}\n\nOnly choose Yes if both numbers match. This grants that device access to the lock screen and UAC prompts.",
-                pending
-                    .comparison
-                    .chars()
-                    .map(|c| c.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-            let yes = unsafe {
-                MessageBoxW(
-                    std::ptr::null_mut(),
-                    wide(&text).as_ptr(),
-                    wide("Portputer: allow device on secure screens").as_ptr(),
-                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
-                )
-            } == IDYES;
-            if yes {
-                connection.request(&Request::Approve { hash: pending.hash })?;
-                // Keep this enrollment window's authenticated pipe alive until
-                // both confirmations are committed, or the attempt expires.
-                while Instant::now() < until {
-                    std::thread::sleep(Duration::from_millis(250));
-                    if connection.request(&Request::Pending)?.pending.is_none() {
-                        return Ok(());
+        match actions.recv_timeout(Duration::from_millis(250)) {
+            Ok(EnrollmentAction::Cancel) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = connection.request(&Request::CancelEnrollment);
+                return Err("Enrollment cancelled.".into());
+            }
+            Ok(EnrollmentAction::Approve) if !approved => {
+                let comparison = pending.as_ref().ok_or("No comparison is ready.")?;
+                connection.request(&Request::Approve {
+                    hash: comparison.hash.clone(),
+                })?;
+                approved = true;
+                let _ = updates.send(EnrollmentUpdate::Approved);
+            }
+            _ => {}
+        }
+        let next = connection.request(&Request::Pending)?.pending;
+        if approved && next.is_none() {
+            let _ = updates.send(EnrollmentUpdate::Complete);
+            return Ok(());
+        }
+        if let Some(next) = next {
+            if pending.as_ref().is_none_or(|old| old.hash != next.hash) {
+                if approved {
+                    return Err("Enrollment changed. Start again on both devices.".into());
+                }
+                let _ = updates.send(EnrollmentUpdate::Pending(next.comparison.clone()));
+                pending = Some(next);
+            }
+        }
+    }
+    let _ = connection.request(&Request::CancelEnrollment);
+    Err("Enrollment expired. Start again on both devices.".into())
+}
+fn enroll_ui(owner: HWND) -> Result<()> {
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let (update_tx, update_rx) = std::sync::mpsc::channel();
+    // Create and paint before any service or pipe calls.
+    let window = EnrollmentWindow::new(owner, action_tx.clone())?;
+    let worker = std::thread::spawn(move || {
+        if let Err(error) = enrollment_requests(action_rx, update_tx.clone()) {
+            let _ = update_tx.send(EnrollmentUpdate::Failed(error.to_string()));
+        }
+    });
+    let mut complete = false;
+    while window.open() {
+        while let Ok(update) = update_rx.try_recv() {
+            match update {
+                EnrollmentUpdate::Pending(comparison) => window.pending(&comparison),
+                EnrollmentUpdate::Approved => window.message("Windows confirmation accepted.\r\nConfirm the same comparison on the controlling device."),
+                EnrollmentUpdate::Complete => { complete = true; break; }
+                EnrollmentUpdate::Failed(error) => {
+                    window.message(&format!("Secure-screen enrollment did not complete.\r\n{}\r\nClose this window and start again on both devices.", error));
+                    unsafe {
+                        windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(GetDlgItem(window.hwnd, ENROLL_APPROVE as i32), 0);
+                        SetWindowTextW(GetDlgItem(window.hwnd, IDCANCEL), wide("Close").as_ptr());
                     }
                 }
             }
-            let _ = connection.request(&Request::CancelEnrollment);
-            return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(250));
+        if complete {
+            break;
+        }
+        unsafe {
+            MsgWaitForMultipleObjects(0, std::ptr::null(), 0, 50, QS_ALLINPUT);
+        }
     }
-    let _ = connection.request(&Request::CancelEnrollment);
-    Err("Enrollment timed out. Start again on both devices.".into())
+    let _ = action_tx.send(EnrollmentAction::Cancel);
+    let _ = worker.join();
+    if complete {
+        Ok(())
+    } else {
+        Err("Enrollment cancelled or failed.".into())
+    }
 }
 
 #[cfg(test)]
@@ -1145,5 +1410,154 @@ mod tests {
             .is_err()
         );
         assert!(state.borrow().enrollment.is_none());
+    }
+    #[test]
+    fn closed_enrollment_cannot_report_successful_completion() {
+        let state = RefCell::new(State {
+            enrollment: None,
+            active: HashMap::new(),
+            next: 1,
+            upload: None,
+        });
+        assert!(
+            handle_request(
+                Request::Pending,
+                true,
+                1,
+                &state,
+                &[0; 32],
+                &mut None,
+                &mut false
+            )
+            .is_err()
+        );
+        state.borrow_mut().enrollment = Some(Enrollment {
+            owner: 1,
+            until: Instant::now() + Duration::from_secs(30),
+            attempts: 1,
+            pending: Some(2),
+        });
+        assert!(
+            handle_request(
+                Request::Pending,
+                true,
+                1,
+                &state,
+                &[0; 32],
+                &mut None,
+                &mut false
+            )
+            .is_err()
+        );
+        state.borrow_mut().enrollment.as_mut().unwrap().pending = None;
+        assert!(
+            handle_request(
+                Request::Pending,
+                true,
+                2,
+                &state,
+                &[0; 32],
+                &mut None,
+                &mut false
+            )
+            .is_err()
+        );
+        assert!(
+            handle_request(
+                Request::Pending,
+                true,
+                1,
+                &state,
+                &[0; 32],
+                &mut None,
+                &mut false
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop; run on the test VM"]
+    fn waiting_dialog_exists_before_handshake_and_accepts_cancel() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let window = EnrollmentWindow::new(std::ptr::null_mut(), tx).unwrap();
+        unsafe {
+            assert_ne!(IsWindowVisible(window.hwnd), 0);
+            let mut class = [0u16; 32];
+            let len = GetClassNameW(window.hwnd, class.as_mut_ptr(), class.len() as i32);
+            assert_eq!(String::from_utf16_lossy(&class[..len as usize]), "#32770");
+            assert_eq!(
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(GetDlgItem(
+                    window.hwnd,
+                    ENROLL_APPROVE as i32
+                )),
+                0
+            );
+        }
+        // No helper connection or controlling device exists in this test.
+        let hwnd = window.hwnd as usize;
+        let close = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            unsafe {
+                PostMessageW(hwnd as HWND, WM_CLOSE, 0, 0);
+            }
+        });
+        let until = Instant::now() + Duration::from_secs(2);
+        while window.open() && Instant::now() < until {
+            unsafe {
+                MsgWaitForMultipleObjects(0, std::ptr::null(), 0, 20, QS_ALLINPUT);
+            }
+        }
+        close.join().unwrap();
+        assert_eq!(
+            unsafe { IsWindow(window.hwnd) },
+            0,
+            "waiting dialog must process Cancel without service input"
+        );
+        assert!(matches!(rx.try_recv(), Ok(EnrollmentAction::Cancel)));
+    }
+    #[test]
+    fn reaping_dead_worker_removes_its_discovery_file() {
+        use std::os::windows::process::CommandExt;
+        let mut random = [0; 8];
+        getrandom::fill(&mut random).unwrap();
+        let root = std::env::temp_dir().join(format!("portputer-reap-{}", hex::encode(random)));
+        std::fs::create_dir(&root).unwrap();
+        let discovery = root.join("session.json");
+        std::fs::write(&discovery, "stale test publication").unwrap();
+        let mut process = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        process.wait().unwrap();
+        let mut handle = std::ptr::null_mut();
+        unsafe {
+            assert_ne!(
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    process.as_raw_handle(),
+                    GetCurrentProcess(),
+                    &mut handle,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS
+                ),
+                0
+            );
+            let stop = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            assert!(!stop.is_null());
+            drop(Child {
+                process: handle,
+                stop,
+                discovery: discovery.clone(),
+            });
+        }
+        assert!(
+            !discovery.exists(),
+            "service must clean discovery even when the worker exited abruptly"
+        );
+        std::fs::remove_dir(root).unwrap();
     }
 }

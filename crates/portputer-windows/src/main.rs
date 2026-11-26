@@ -29,6 +29,5 @@ fn main() {
 
 #[cfg(windows)]
 fn main() {
-    secure_input::wait_for_previous_process();
     app::run();
 }

@@ -1,4 +1,5 @@
 import AppKit
+import Accessibility
 import Foundation
 
 /// This Mac as the controlling side: finding computers, the connection, and
@@ -58,11 +59,115 @@ final class ClientModel: ObservableObject {
     /// Use Internet Relay: off for each connection.
     @Published private(set) var useRelay = false
     @Published private(set) var relayAvailable = false
-    @Published var secureComparison: String?
-    func useNormalKeyboard() { secureComparison = nil; session?.useNormalKeyboard() }
+    @Published var secureComparison: String? {
+        didSet {
+            if secureComparison == nil {
+                secureAlertGeneration += 1
+                if let alert = secureAlert {
+                    secureAlert = nil
+                    if let parent = alert.window.sheetParent {
+                        parent.endSheet(alert.window, returnCode: .abort)
+                    }
+                }
+            }
+        }
+    }
+    private var secureAlert: NSAlert?
+    private var secureAlertGeneration = 0
+
+    private func presentSecureComparison(_ comparison: String) {
+        setCapturing(false)
+        secureComparison = nil
+        secureComparison = comparison
+        let generation = secureAlertGeneration
+        Windows.show(Windows.client)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.secureComparison == comparison, self.secureAlertGeneration == generation else { return }
+            guard let parent = NSApp.windows.first(where: { $0.title == "Connect to Computer" }) ?? NSApp.keyWindow else {
+                self.message = "Open Connect to Computer and try Allow Secure Screens again."
+                announce(self.message)
+                return
+            }
+            let alert = NSAlert()
+            alert.messageText = "Allow Secure Screens"
+            alert.informativeText = "Compare this number with the administrator window on Windows: "
+                + comparison.map(String.init).joined(separator: " ")
+                + ". Only confirm if both numbers match. Keyboard input is paused."
+            alert.addButton(withTitle: "Numbers Match")
+            alert.addButton(withTitle: "Cancel")
+            alert.buttons[0].keyEquivalent = ""
+            alert.buttons[1].keyEquivalent = "\u{1b}"
+            self.secureAlert = alert
+            NSApp.activate(ignoringOtherApps: true)
+            parent.makeKeyAndOrderFront(nil)
+            alert.beginSheetModal(for: parent) { [weak self] response in
+                Task { @MainActor in
+                    guard let self, self.secureComparison == comparison, self.secureAlertGeneration == generation else { return }
+                    self.secureAlert = nil
+                    if response == .alertFirstButtonReturn {
+                        self.confirmSecureInput(comparison: comparison)
+                    } else {
+                        self.secureComparison = nil
+                    }
+                }
+            }
+        }
+    }
+    private var normalKeyboardAlert: NSAlert?
+
+    private func dismissNormalKeyboardConfirmation() {
+        guard let alert = normalKeyboardAlert else { return }
+        normalKeyboardAlert = nil
+        if let parent = alert.window.sheetParent {
+            parent.endSheet(alert.window, returnCode: .abort)
+        }
+    }
+
+    func requestNormalKeyboard() {
+        guard canSend, let target = info?.id, normalKeyboardAlert == nil else { return }
+        guard secureComparison == nil else {
+            message = "Finish or cancel secure-screen enrollment first."
+            AccessibilityNotification.Announcement(message).post()
+            return
+        }
+        setCapturing(false)
+        let requestedGeneration = generation
+        let alert = NSAlert()
+        alert.messageText = "Use Normal Keyboard Only?"
+        alert.informativeText = "Secure-screen input will be unavailable. Ordinary input can be read by the Windows application. Keyboard input is paused for this confirmation."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Use Normal Keyboard Only")
+        alert.buttons[0].keyEquivalent = "\r"
+        alert.buttons[1].keyEquivalent = ""
+        normalKeyboardAlert = alert
+        Windows.show(Windows.client)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.normalKeyboardAlert === alert,
+                  self.generation == requestedGeneration, self.info?.id == target, self.canSend else { return }
+            guard let parent = NSApp.windows.first(where: { $0.title == "Connect to Computer" }) ?? NSApp.keyWindow else {
+                self.normalKeyboardAlert = nil
+                self.message = "Open Connect to Computer and try Use Normal Keyboard Only again."
+                AccessibilityNotification.Announcement(self.message).post()
+                return
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            parent.makeKeyAndOrderFront(nil)
+            alert.beginSheetModal(for: parent) { [weak self] response in
+                Task { @MainActor in
+                    guard let self, self.normalKeyboardAlert === alert else { return }
+                    self.normalKeyboardAlert = nil
+                    guard self.generation == requestedGeneration, self.info?.id == target, self.canSend else { return }
+                    if response == .alertSecondButtonReturn { self.useNormalKeyboard() }
+                }
+            }
+        }
+    }
+
+    private func useNormalKeyboard() { secureComparison = nil; session?.useNormalKeyboard() }
     func beginSecureEnrollment() { session?.beginSecureEnrollment() }
-    func confirmSecureInput() {
-        if let comparison = secureComparison { session?.confirmSecureInput(comparison: comparison) }
+    func confirmSecureInput(comparison: String) {
+        guard secureComparison == comparison else { return }
+        session?.confirmSecureInput(comparison: comparison)
         secureComparison = nil
     }
     @Published var message = ""
@@ -215,6 +320,8 @@ final class ClientModel: ObservableObject {
     }
 
     func disconnect() {
+        dismissNormalKeyboardConfirmation()
+        secureComparison = nil
         generation += 1
         setCapturing(false)
         session?.disconnect()
@@ -355,6 +462,8 @@ final class ClientModel: ObservableObject {
         func reconnecting() {
             onMain { m in
                 if let info = m.info {
+                    m.dismissNormalKeyboardConfirmation()
+                    m.secureComparison = nil
                     m.state = .reconnecting(info)
                     m.audioOn = false
                     announce("Connection to \(info.name) lost. Reconnecting.")
@@ -366,6 +475,8 @@ final class ClientModel: ObservableObject {
             onMain { m in
                 let name = m.info?.name ?? ""
                 m.setCapturing(false)
+                m.dismissNormalKeyboardConfirmation()
+                m.secureComparison = nil
                 m.session = nil
                 m.audioOn = false
                 m.audioWanted = false
@@ -376,8 +487,16 @@ final class ClientModel: ObservableObject {
         }
 
         func notice(code: String, message: String) { onMain { m in
-            if code == "secure_input_compare" { m.setCapturing(false); m.secureComparison = message }
-            else { m.message = message }
+            if code == "secure_input_compare" {
+                m.presentSecureComparison(message)
+            }
+            else {
+                if code.hasPrefix("secure_input_") {
+                    if code != "secure_input_paused" { m.secureComparison = nil }
+                    if m.message != message { AccessibilityNotification.Announcement(message).post() }
+                }
+                m.message = message
+            }
         } }
 
         func error(code: String, message: String) {

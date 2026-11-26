@@ -512,14 +512,7 @@ async fn serve(shared: Arc<Shared>, stream: transport::BoxStream, address: Optio
                 ClientMessage::SecureInput { request } => {
                     let relay = shared.secure_input.lock().unwrap().clone();
                     let pipe = secure_pipe.take();
-                    let result = tokio::task::spawn_blocking(move || {
-                        let mut pipe = match pipe {
-                            Some(pipe) => pipe,
-                            None => relay.ok_or("Secure-screen input is unavailable.")?.connect()?,
-                        };
-                        let reply = pipe.exchange(request)?;
-                        Ok::<_,String>((pipe, reply))
-                    }).await.map_err(|_| Error::Protocol("secure-input relay stopped".into()))?;
+                    let result = tokio::task::spawn_blocking(move || exchange_secure_input(relay, pipe, request)).await.map_err(|_| Error::Protocol("secure-input relay stopped".into()))?;
                     match result {
                         Ok((pipe,mut reply)) => {
                             secure_pipe=Some(pipe);
@@ -1125,5 +1118,68 @@ fn send_thread(hub: Arc<HubInner>, rx: std::sync::mpsc::Receiver<Vec<i16>>, fram
                 let _ = sub.socket.send_to(&sub.key.seal(udp::KIND_AUDIO, seq, &payload), addr);
             }
         }
+    }
+}
+
+fn exchange_secure_input(
+    relay: Option<Arc<dyn crate::secure_input::Relay>>,
+    pipe: Option<Box<dyn crate::secure_input::RelayConnection>>,
+    request: crate::secure_input::RelayRequest,
+) -> Result<(Box<dyn crate::secure_input::RelayConnection>, crate::secure_input::RelayReply), String> {
+    // Open starts a new authenticated session. The helper may have closed
+    // the previous pipe while this controller used ordinary input.
+    let pipe = if matches!(&request, crate::secure_input::RelayRequest::Open { .. }) {
+        drop(pipe);
+        None
+    } else {
+        pipe
+    };
+    let mut pipe = match pipe {
+        Some(pipe) => pipe,
+        None => relay.ok_or("Secure-screen input is unavailable.")?.connect()?,
+    };
+    let reply = pipe.exchange(request)?;
+    Ok((pipe, reply))
+}
+
+#[cfg(test)]
+mod secure_relay_tests {
+    use super::*;
+    use crate::secure_input::{Relay, RelayConnection, RelayReply, RelayRequest, VERSION};
+    struct ClosedPipe;
+    impl RelayConnection for ClosedPipe {
+        fn exchange(&mut self, _: RelayRequest) -> Result<RelayReply, String> {
+            Err("helper closed idle pipe".into())
+        }
+    }
+    struct FreshPipe;
+    impl RelayConnection for FreshPipe {
+        fn exchange(&mut self, request: RelayRequest) -> Result<RelayReply, String> {
+            Ok(RelayReply { version: VERSION, secure_desktop: false,
+                opened: matches!(request, RelayRequest::Open { .. }), frame: None, normal_input: None })
+        }
+    }
+    #[derive(Default)]
+    struct TestRelay(AtomicU32);
+    impl Relay for TestRelay {
+        fn connect(&self) -> Result<Box<dyn RelayConnection>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FreshPipe))
+        }
+    }
+    #[test]
+    fn enrollment_after_idle_starts_on_a_fresh_pipe() {
+        let relay = Arc::new(TestRelay::default());
+        let result = exchange_secure_input(Some(relay.clone()), Some(Box::new(ClosedPipe)),
+            RelayRequest::Open { version: VERSION, enroll: true });
+        assert!(result.is_ok(), "enrollment must not use the expired pipe");
+        assert_eq!(relay.0.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn failed_input_is_never_reconnected_or_replayed() {
+        let relay = Arc::new(TestRelay::default());
+        assert!(exchange_secure_input(Some(relay.clone()), Some(Box::new(ClosedPipe)),
+            RelayRequest::Frame { frame: vec![1, 2, 3] }).is_err());
+        assert_eq!(relay.0.load(Ordering::SeqCst), 0);
     }
 }

@@ -3,9 +3,7 @@ use crate::ui;
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HWND},
-        System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-        },
+        System::Threading::{GetExitCodeProcess, WaitForSingleObject},
         UI::{
             Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
             WindowsAndMessaging::*,
@@ -36,7 +34,12 @@ pub fn request(hwnd: HWND, on: bool) -> Result<bool, String> {
         }
         launch(hwnd, installer, "", on)?;
     } else {
-        launch(hwnd, &helper, if on { "--enroll" } else { "--disable" }, on)?;
+        let arguments = if on {
+            format!("--enroll --owner {}", hwnd.0 as usize)
+        } else {
+            "--disable".into()
+        };
+        launch(hwnd, &helper, &arguments, on)?;
     }
     Ok(true)
 }
@@ -83,20 +86,4 @@ fn launch(hwnd: HWND, path: &std::path::Path, args: &str, on: bool) -> Result<()
         });
     });
     Ok(())
-}
-pub fn wait_for_previous_process() {
-    let args: Vec<_> = std::env::args().collect();
-    if let Some(pid) = args
-        .iter()
-        .position(|s| s == "--wait-for-exit")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<u32>().ok())
-    {
-        unsafe {
-            if let Ok(process) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
-                WaitForSingleObject(process, 15_000);
-                let _ = CloseHandle(process);
-            }
-        }
-    }
 }

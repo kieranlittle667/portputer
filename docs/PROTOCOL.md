@@ -44,7 +44,7 @@ A man in the middle has a different `h` with each side, so can't produce either 
 
 | Type | Fields |
 |---|---|
-| `welcome` | `server_id`, `name`, `os`, `session`, `user`, `paired`, `version`, `power` (actions available), `audio` (bool), `mute` (bool: speakers can be muted while streaming), `mic` (bool: the Portputer Microphone driver is installed), `files` (bool: clipboard and file transfer) |
+| `welcome` | `server_id`, `name`, `os`, `session`, `user`, `paired`, `version`, `power` (actions available), `audio` (bool), `mute` (bool: speakers can be muted while streaming), `mic` (bool: the Portputer Microphone driver is installed), `files` (bool: clipboard and file transfer), `secure_input` (optional bool; Windows secure-input relay capability, default false) |
 | `paired` | `proof` |
 | `error` | `code`, `message` |
 | `notice` | `code`, `message` (such as a missing permission on the server) |
@@ -56,6 +56,7 @@ A man in the middle has a different `h` with each side, so can't produce either 
 | `addresses` | `addresses`, `port`: every address the server has (local network, Tailscale and other VPNs); sent to paired clients only |
 | `clipboard_text` | `text` copied on the server (up to 60,000 bytes) |
 | `clipboard_files` | `files`: `name` and `size` of each file copied on the server |
+| `secure_input` | `reply`: Windows secure-input relay reply; see below |
 | `pong` | `n` |
 
 Error codes: `not_paired`, `pairing_failed`, `no_pairing_code`, `unsupported`, `power_failed`, `audio_failed`, `mute_failed`, `mic_failed`, `bad_message`, `version`.
@@ -77,11 +78,28 @@ The speakers are muted while any client streaming audio asks for it, and unmuted
 | `clipboard_text` | `text`: put on the server's clipboard |
 | `mic_start` / `mic_stop` | the client's microphone, to the server's Portputer Microphone; `mic_start` takes `turn` as `audio_start` does |
 | `power` | `action`: `restart`, `shutdown`, `sleep`, `log_out`, `lock`, `force_restart`, `unlocked_restart`; `user` and `password` for `unlocked_restart` |
+| `secure_input` | `request`: Windows secure-input relay request; requires ordinary pairing |
 | `ping` | `n`, every 5 seconds |
 
 Keys are W3C `KeyboardEvent.code` values: the physical key, not the character. The server's system applies its own keyboard layout. `crates/portputer-core/src/keys.rs` maps each code to Linux input codes (Android scan codes), Android key codes, macOS virtual key codes and Windows scan codes or virtual keys. Codes Portputer adds: `Fn`, `BrightnessUp`, `BrightnessDown`, `KeyboardBacklightUp`, `KeyboardBacklightDown`, `MissionControl`, `Launchpad`, `Eject`.
 
 The server releases every key a client holds when it disconnects. A client connecting to a paired server tries, all at once, the address it was given, the last one that worked and every address from `addresses`; the first to answer wins. Only if none does, it uses the relay. A relayed connection moves to a direct one when an address answers, unless Use Internet Relay is on; turning it on moves a direct connection to the relay (off for each new session). The client reconnects for up to 20 minutes after an unexpected disconnect, to the server's current announcement (user session first, then login window) or its last address, and drops key events while disconnected.
+
+## Optional Windows secure-input channel
+
+The outer control protocol remains version 1. Clients use the new messages only when `welcome.secure_input` advertises support. This capability and the outer server's desktop hint do not authorize privileged input.
+
+A `secure_input` client message contains `request`, tagged by `op`: `Open {version: 2, enroll: bool}`, `Frame {frame: byte[]}`, or `Status`. The reply contains `version`, `secure_desktop`, `opened` and an optional encrypted `frame`. `opened` marks an Open response so a client can discard responses from an earlier inner session before beginning a replacement handshake.
+
+The inner session is Noise XX with prologue `portputer secure input 2`, using the device's static key and a separate protected service key. Its transport records are JSON tagged by `op`: `Confirm`, `Input {input}`, `Ready {trusted}`, and `Ack {accepted}`. `input` is a bounded `Key`, `Tap`, `Text` or `Release` command. Each inner frame is at most 12 KiB.
+
+Both sides derive the enrollment comparison from SHA-256 of `portputer secure input comparison 2` followed by the Noise handshake hash: the first four digest bytes interpreted big-endian, modulo 1,000,000, formatted as six decimal digits. Acceptance requires device confirmation, elevated Windows confirmation bound to the full hash, and a successful write to the protected device store. Normal `paired.json` entries do not grant this authority.
+
+After enrollment, all keyboard commands use this inner channel. On Winlogon the worker injects them. On Default it returns validated `normal_input` through local IPC for the ordinary application to inject at user integrity. The server removes `normal_input` before forwarding the relay reply over the outer connection. Other desktops or failed desktop checks do not receive this handoff.
+
+Previously enrolled controllers do not automatically fall back to ordinary plaintext keys when the service is unavailable. An explicit local **Use Normal Keyboard Only** choice removes the service pin. The controlling client reserves `secure_input_*` confirmation/status notices for its own state handling; the outer server cannot supply the comparison prompt.
+
+The same outer control transport carries the nested channel directly or through the internet relay. No extra network listener is added. Full enrollment, lifecycle, update and trust-boundary details are in [Windows secure-screen input](../windows/SECURE-INPUT.md).
 
 ## Audio
 

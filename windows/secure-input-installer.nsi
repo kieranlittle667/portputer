@@ -45,9 +45,16 @@ Function ${PREFIX}StopService
     System::Call 'advapi32::OpenSCManagerW(p 0, p 0, i 1) p.r0'
     StrCmp $0 0 failed
     System::Call 'advapi32::OpenServiceW(p r0, w "PortputerSecureInput", i 0x24) p.r1'
-    StrCmp $1 0 close_manager
+    StrCmp $1 0 0 service_opened
+    System::Call 'kernel32::GetLastError() i.r3'
+    ; Only ERROR_SERVICE_DOES_NOT_EXIST permits installation without a stop.
+    StrCmp $3 1060 close_manager
+    System::Call 'advapi32::CloseServiceHandle(p r0)'
+    Goto failed
+    service_opened:
     System::Alloc 28
     Pop $2
+    StrCmp $2 0 close_service_failed
     System::Call 'advapi32::ControlService(p r1, i 1, p r2)'
     StrCpy $4 0
     wait:

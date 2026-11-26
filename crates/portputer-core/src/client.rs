@@ -781,7 +781,7 @@ impl Supervisor {
                                         }
                                         continue;
                                     }
-                                    Err(_)=>{self.emit(SessionEvent::Notice {code:"secure_input_unavailable".into(),message:"Secure-screen input is unavailable for this device.".into()});continue;}
+                                    Err(_)=>{self.emit(SessionEvent::Notice {code:"secure_input_paused".into(),message:"Keyboard input is paused until the protected session is ready.".into()});continue;}
                                     Ok(None)=>{},
                                 }
                             }

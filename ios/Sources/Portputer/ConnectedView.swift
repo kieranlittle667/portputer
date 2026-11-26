@@ -43,11 +43,11 @@ struct ConnectedView: View {
         } message: {
             Text("Secure-screen input will be unavailable. Ordinary input can be read by the Windows application.")
         }
-        .alert("Allow Secure Screens", isPresented: securePrompt) {
-            Button("Numbers Match") { connection.confirmSecureInput() }
+        .alert("Allow Secure Screens", isPresented: securePrompt, presenting: connection.secureComparison) { comparison in
+            Button("Numbers Match") { connection.confirmSecureInput(comparison: comparison) }
             Button("Cancel", role: .cancel) { connection.secureComparison = nil }
-        } message: {
-            Text("Compare this number with the administrator window on the Windows computer: " + (connection.secureComparison ?? "").map(String.init).joined(separator: " ") + ". Only confirm if both numbers match.")
+        } message: { comparison in
+            Text("Compare this number with the administrator window on the Windows computer: " + comparison.map(String.init).joined(separator: " ") + ". Only confirm if both numbers match.")
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
